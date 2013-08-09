@@ -53,6 +53,7 @@ sub showversion
 {
   print "\nSNMPTT $snmptt_version\n";
   print "(c) 2002-2007 Alex Burger\n";
+  print "(c) 2013 NETWAYS GmbH, Markus Frosch\n";
   print "http://snmptt.sourceforge.net\n\n";
 }
 
@@ -193,6 +194,8 @@ my $time_format;
 my $date_time_format;
 my $date_time_format_sql;
 my $stat_time_format_sql;
+my $fix_octets;
+my $fix_octets_limit;
 
 # DaemonMode
 my $daemon_fork;
@@ -3478,6 +3481,53 @@ sub readtrap
     $agent_dns_name = strip_domain_name($agent_dns_name, $strip_domain);
   }
 
+  # detect if a enterprise value is in octet format
+  # and convert it to string while dropping any non-printable char
+  if($fix_octets)
+  {
+    for (my $i=0;$i <= $#entvar;$i++)
+    {
+      my $value = $entvar[$i];
+      my $result = "";
+
+      next if ! $value;
+
+      my $nonprintables = 0;
+      my $octetval = $value;
+      $octetval =~ s/\r?\n/ /gs; # remove any newlines in the octet data
+
+      # check if looks like octet encoded
+      # e.g. "7B 74 65 73 74 20 74 65 73 74 7D "
+      # means: "{test test}"
+      # comment: this kind of string should never come in octet format
+      #          it happens mostly with e.g. German umlauts
+      if ($octetval =~ m/^(?:([0-9A-F]{2})\s+)*([0-9A-F]{2})\s*$/g)
+      {
+        foreach(split(/\s+/, $octetval))
+        {
+          my $char = chr hex $_; # convert to char
+          if($char =~ m/[[:print:]]/) # is it printable?
+          {
+            $result .= $char;
+          }
+          else
+          {
+            $nonprintables++;
+            last if $nonprintables > $fix_octets_limit; # get out early
+            $result .= "_";
+          }
+        }
+        if($nonprintables > $fix_octets_limit) {
+          next;
+        }
+        else
+        {
+          $entvar[$i] = $result;
+        }
+      }
+    }
+  }
+
   if ($DEBUGGING >= 1)
   {
     print "Trap received from $tempvar[0]: $tempvar[5]\n";
@@ -4086,6 +4136,8 @@ sub loadsnmpttini {
   $date_format = $cfg->val('General', 'date_format');
   $time_format = $cfg->val('General', 'time_format');
   $date_time_format = $cfg->val('General', 'date_time_format');
+  $fix_octets = $cfg->val('General','fix_octets');
+  $fix_octets_limit = $cfg->val('General','fix_octets_limit');
 
   # DaemonMode
   $daemon_fork = $cfg->val('DaemonMode', 'daemon_fork');
@@ -4241,6 +4293,8 @@ sub loadsnmpttini {
   if (! defined ($use_trap_time)) { $use_trap_time = 1} ;
   if (! defined ($keep_unlogged_traps)) { $keep_unlogged_traps = 1} ;
   if (! defined ($duplicate_trap_window)) { $duplicate_trap_window = 0} ;
+  if (! defined ($fix_octets)) { $fix_octets = 1} ;
+  if (! defined ($fix_octets_limit)) { $fix_octets_limit = 10} ;
 
   if (! defined ($stdout_enable)) { $stdout_enable = 0} ;
   if (! defined ($log_enable)) { $log_enable = 1} ;
