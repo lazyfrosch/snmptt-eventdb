@@ -53,6 +53,8 @@ sub showversion
 {
   print "\nSNMPTT $snmptt_version\n";
   print "(c) 2002-2007 Alex Burger\n";
+  print "(c) 2012 NETWAYS GmbH, Christoph Niemann\n";
+  print "(c) 2013 NETWAYS GmbH, Markus Frosch\n";
   print "http://snmptt.sourceforge.net\n\n";
 }
 
@@ -292,6 +294,10 @@ my @sql_custom_columns_unknown;
 
 # TrapFiles
 my @snmptt_conf_files;
+
+# Time exceptions
+my @time_exceptions;
+my @time_exceptions_resolved;
 
 ##############################################################################
 #
@@ -1629,6 +1635,33 @@ sub processtrap
           if ($DEBUGGING >= 1)
           {
             print "  PREEXEC line not defined\n";
+          }
+        }
+      }
+
+      # Process time exceptions here
+      if (@time_exceptions > 0) {
+        print "timeexeceptions: check if we have something todo\n" if $DEBUGGING>0;
+
+        my @current_time = localtime();
+        foreach my $time_exception (@time_exceptions_resolved)
+        {
+          if ($agent_dns_name =~ m/^$time_exception->{hostname}$/i)
+          {
+            print "timeexceptions: found rule for hostname $agent_dns_name\n" if $DEBUGGING>0;
+
+            # calculating minutes of day for comparsion
+            my $start_stamp = $time_exception->{start_hour} * 60 + $time_exception->{start_minute};
+            my $end_stamp = $time_exception->{end_hour} * 60 + $time_exception->{end_minute};
+            my $current_stamp = $current_time[2] * 60 + $current_time[1];
+
+            if ($current_stamp >= $start_stamp && $current_stamp <= $end_stamp) {
+              if ($message_short =~ /$time_exception->{pattern}/i) {
+                print "timeexceptions: setting new severtiy $time_exception->{newseverity}\n" if $DEBUGGING>0;
+                $event2[2]= $time_exception->{newseverity};
+                last; # first match wins
+              }
+            }
           }
         }
       }
@@ -4185,6 +4218,31 @@ sub loadsnmpttini {
 
   $date_time_format_sql = $cfg->val('SQL', 'date_time_format_sql');
   $stat_time_format_sql = $cfg->val('SQL', 'stat_time_format_sql');
+
+  # Time interval Exceptions
+  @time_exceptions = $cfg->val('TimeException', 'timeexceptions');
+  @time_exceptions_resolved = ();
+
+  # parse settings
+  foreach my $time_exception (@time_exceptions)
+  {
+    #                            hostname    ,     starttime       ,     endtime         ,    pattern    ,  newseverity
+    if ($time_exception =~ m/^\s*([^,\s]+)\s*,\s*(\d?\d):(\d?\d)\s*,\s*(\d?\d):(\d?\d)\s*,\s*([^,\s]+)\s*,\s*([^,\s]+)\s*$/i)
+    {
+      push @time_exceptions_resolved, {
+        hostname     => $1,
+        start_hour   => $2,
+        start_minute => $3,
+        end_hour     => $4,
+        end_minute   => $5,
+        pattern      => $6,
+        newseverity  => $7,
+      };
+    }
+    else {
+      print "ERROR: timeexceptions - could not parse setting line: $time_exception\n";
+    }
+  }
   
   # Debugging
   if ($debugcmdline == 0) {
@@ -4263,6 +4321,8 @@ sub loadsnmpttini {
   if (! defined ($pre_exec_enable)) { $pre_exec_enable = 1} ;
   if (! defined ($unknown_trap_exec)) { $unknown_trap_exec = ''} ;
   if (! defined ($unknown_trap_exec_format)) { $unknown_trap_exec_format = ''} ;
+  if (! defined (@time_exceptions)) { @time_exceptions = ()} ;
+  if (! defined (@time_exceptions_resolved)) { @time_exceptions_resolved = ()} ;
   if (! defined ($exec_escape)) {
     if ($^O =~ /MSWin32/) {
       $exec_escape = 0;
