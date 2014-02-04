@@ -5,6 +5,9 @@
 # Copyright 2002-2009 Alex Burger
 # alex_b@users.sourceforge.net
 # 4/11/2002
+# Copyright 2012 NETWAYS GmbH, Jannis Mosshammer, Philipp Deneu,
+#                              Christoph Niemann, Markus Frosch
+# Copyright 2013 NETWAYS GmbH, Markus Frosch
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -53,6 +56,8 @@ sub showversion
 {
   print "\nSNMPTT $snmptt_version\n";
   print "(c) 2002-2007 Alex Burger\n";
+  print "(c) 2012 NETWAYS GmbH, Jannis Mosshammer, Philipp Deneu, Christoph Niemann, Markus Frosch\n";
+  print "(c) 2013 NETWAYS GmbH, Markus Frosch\n";
   print "http://snmptt.sourceforge.net\n\n";
 }
 
@@ -69,6 +74,7 @@ my $dump = 0;
 my $help = 0;
 my $time = 0;
 my $ini = '';
+my $timeexceptions_conf;
 
 GetOptions 	('version' => \$version, 
     'daemon' => \$daemon,
@@ -193,6 +199,7 @@ my $time_format;
 my $date_time_format;
 my $date_time_format_sql;
 my $stat_time_format_sql;
+my $fix_octets;
 
 # DaemonMode
 my $daemon_fork;
@@ -240,6 +247,10 @@ my $unknown_trap_exec;
 my $unknown_trap_exec_format;
 my $exec_escape;
 
+my $edbc_enable;
+my $edbc_pipe;
+my $trapstring;
+ 
 # SQL
 my $db_translate_enterprise;
 my $db_unknown_trap_format;
@@ -287,11 +298,35 @@ my $sql_win32_odbc_table_statistics;
 my $sql_win32_odbc_username;
 my $sql_win32_odbc_password;
 
+my $oracle_dbi_enable;
+my $oracle_dbi_module;
+my $oracle_dbi_timeformat;
+my $oracle_dbi_hostport_enable;
+my $oracle_dbi_host;
+my $oracle_dbi_port;
+my $oracle_dbi_sid;
+my $oracle_dbi_table;
+my $oracle_dbi_table_unknown;
+my $oracle_dbi_table_statistics;
+my $oracle_dbi_username;
+my $oracle_dbi_password;
+my $oracle_ping_on_insert;
+my $oracle_ping_interval;
+
 my @sql_custom_columns;
 my @sql_custom_columns_unknown;
 
 # TrapFiles
 my @snmptt_conf_files;
+
+# Time exceptions 
+my @time_exceptions_file;
+my @time_exceptions;
+
+# Hostrewrite 
+my $hostrewrite_enable;
+my @hostrewrite_hosts;
+my $hostrewrite_stripdomain;
 
 ##############################################################################
 #
@@ -300,6 +335,18 @@ my @snmptt_conf_files;
 
 &findsnmpttini;
 &loadsnmpttini;
+
+if (defined $timeexceptions_conf) {
+	if (-e $timeexceptions_conf) {
+		open (my $fh, '<', $timeexceptions_conf) or die "Can't read $timeexceptions_conf: $!";
+		@time_exceptions_file = <$fh>;
+		close $fh;
+	}
+	else {
+		print "No time-exceptions configuration-file found.\n";
+		die "died";
+	}
+}
 
 ##############################################################################
 
@@ -579,6 +626,18 @@ if ($duplicate_trap_window > 0)
   require Digest::MD5;
 }
 
+if ($oracle_dbi_enable == 1)
+{
+  eval 'require require DBD::Oracle;';
+  if ($@) {
+    warn $@;
+    print "\nCould not load the Perl module DBD::Oracle!  If oracle_dbi_enable\n";
+    print "is set then the DBD::Oracle module is required.  Please see snmptt.html\n";
+    print "for system requirements.\n\n";
+    die "died";
+  }
+  require DBD::Oracle;
+}
 
 ##############################################################################
 ####  MAIN SECTION START
@@ -623,11 +682,13 @@ my $dbh_mysql;
 my $dbh_postgresql;
 my $dbh_odbc;
 my $dbh_win32_odbc;
+my $dbh_oracle;
 
 # Global variables for SQL ping
 my $g_last_mysql_ping = $g_start_time;
 my $g_last_postgresql_ping = $g_start_time;
 my $g_last_dbd_odbc_ping = $g_start_time;
+my $g_last_oracle_ping = $g_start_time;
 
 # Global variables for daemon mode
 my $timetoreload;
@@ -751,7 +812,7 @@ if ($daemon == 1)
     POSIX:setsid
        or die "Can't start a new session: $!";
     #umask 0;
-    umask 002;
+    umask 022;
 
     # We fork again so there are two processes.  The first which is run using the uid
     # of the user that started snmptt, and the second which is run as the user as 
@@ -794,7 +855,7 @@ if ($daemon == 1)
       POSIX:setsid
         or die "Can't start a new session: $!";
       #umask 0;
-      umask 002;
+      umask 022;
     }
   } 
 
@@ -1143,6 +1204,12 @@ if ($daemon == 1)
         &dbd_odbc_ping();
       }
     }
+	 
+	 if ($oracle_dbi_enable == 1 && $oracle_ping_interval > 0) {
+	 	if (time() >= ($g_last_oracle_ping + $oracle_ping_interval)) {
+			&oracle_ping();
+		}
+	 }
 
     if ($timetologstatistics == 1)
     {
@@ -1633,6 +1700,36 @@ sub processtrap
         }
       }
 
+			# Process time exceptions here
+			if (defined $timeexceptions_conf) {
+				my @current_time = localtime(); 
+				foreach my $line (@time_exceptions_file) {
+					if ($line =~ m/^INT\s(.*),\s?(\d\d):(\d\d),\s?(\d\d):(\d\d),\s?(.*),\s?(.*)/) {
+						my $except_host = $1;
+						my $start_hour = $2;
+						my $start_minute = $3;
+						my $end_hour = $4;
+						my $end_minute = $5;
+						my $time_exceptions_pattern = $6;
+						my $time_exceptions_severity = $7;
+						$start_hour =~ s/0(\d)/$1/;
+						$start_minute =~ s/0(\d)/$1/;
+						$end_hour =~ s/0(\d)/$1/;
+						$end_minute =~ s/0(\d)/$1/;
+						my $start_stamp = $start_hour * 60 + $start_minute;
+						my $end_stamp = $end_hour * 60 + $end_minute;
+						my $current_stamp = $current_time[2] * 60 + $current_time[1];
+						if ($agent_dns_name =~ /$except_host/i) {
+							if ($current_stamp >= $start_stamp && $current_stamp <= $end_stamp) {
+								if ($message_short =~ /$time_exceptions_pattern/) {
+									$event2[2]= $time_exceptions_severity;
+								}
+							}
+						}
+					}
+				}
+			}
+
       if ($DEBUGGING >= 1)
       {
         print "\n\nFORMAT line:\n";				
@@ -1656,6 +1753,42 @@ sub processtrap
         &substitute;
 
         $message_short = $_;
+
+        # Handle Host Rewrite
+        if($hostrewrite_enable and @hostrewrite_hosts > 0) {
+					print "hostrewrite: going through hosts\n" if $DEBUGGING>0;
+					foreach(@hostrewrite_hosts) {
+						foreach my $strip_domain_list_temp (@strip_domain_list)
+						{
+						  if(($agent_dns_name =~ m/$_/i and $message_short =~ m/^(g[\w]{1}[\d]{1,2}[\w\d]+)(\.[^\s\:]+)/i) || ($agent_dns_name =~ m/$_/i and $message_short =~ m/(g[\w]{1}[\d]{1,2}[\w\d]+).($strip_domain_list_temp)[\S\D\W]+/i) || ($agent_dns_name =~ m/$_/i and $message_short =~ m/(g[\w]{1}[\d][\w\-]+[\d]+[\w])/i)) {
+								my $fhost = $1;
+								my $fdom = $2;
+								if ($fdom eq '') {
+									$fdom = $strip_domain_list_temp;
+								}
+								print "hostrewrite: found host $fhost.$fdom in message from sender $_\n" if $DEBUGGING>0;
+								my $msgtemp = $message_short;
+								if ($msgtemp =~ m/^$fhost/) {
+									$msgtemp =~ s/^$fhost/(via $agent_dns_name)/;
+									print "hostrewrite: replaced $fhost.$fdom (via $agent_dns_name) in message\n" if $DEBUGGING>0;
+								} else {
+									$msgtemp = "(via $agent_dns_name) $msgtemp";
+									print "hostrewrite: added (via $agent_dns_name) to message\n" if $DEBUGGING>0;
+								}
+								$message_short = $msgtemp;
+								if($hostrewrite_stripdomain and $fdom) {
+									$agent_dns_name = $fhost;
+								  print "hostrewrite: set $fhost as agent_dns_name\n" if $DEBUGGING>0;
+								}
+								else {
+								  print "hostrewrite: set $fhost$fdom as agent_dns_name\n" if $DEBUGGING>0;
+									$agent_dns_name = $fhost.$fdom;
+								}
+							}
+						}
+					}
+					print "hostrewrite: done for here\n" if $DEBUGGING>0;
+				}
 
         $message = "$receivedtrap_trans $event2[2] \"$event2[1]\" $agent_dns_name - $message_short\n";
 
@@ -1852,22 +1985,69 @@ sub processtrap
           }
 
           if (&mysql_insert($mysql_dbi_table,
-            "eventname", $event2[0],                # $N
-            "eventid", $receivedtrap_entry,         # $i
-            "trapoid", $receivedtrap_trans,         # $O
-            "enterprise", $db_enterprise,           # $E or $e depending on $db_translate_enterprise
-            "community", $community,                # $C
-            "hostname", $agent_dns_name,            # $A
-            "agentip", $var[4],                     # $aA
-            "category", $event2[1],                 # $c
-            "severity", $event2[2],                 # $s
-            "uptime", $var[2],                      # $T
-            "traptime", $trap_date_time_sql,
-            "formatline", $message_short2,
-            @t_sql_custom_columns) == 1 ) { # 
+            "host_name",    $agent_dns_name,        # $A
+            "host_address", getBinaryIpV6($var[4]), # $aA
+            "type",         1, # SNMP Trap
+            "facility",     undef, # EventDB shall allow NULL, as there is no SNMP facility
+            "priority", getNumericPriority($event2[2]), # $s
+            "program", "snmptrap",
+            "message", $message_short2,
+            "created", $trap_date_time_sql,
+            @t_sql_custom_columns) == 1 ) { #
             $trap_successfully_logged++;
           }
         }
+  if ($edbc_enable == 1) 
+  {
+      $trap_attempted_to_log++;
+      open(EDBC_PIPE,">>$edbc_pipe");
+      $trapstring = $agent_dns_name."\t".$var[4]."\t".getNumericPriority($event2[2])."\t".$trap_date_time_sql."\t".$message_short."\n";
+      print EDBC_PIPE $trapstring;
+      close(EDBC_PIPE);
+			$trap_successfully_logged++;
+  }
+
+
+ 	if ($oracle_dbi_enable == 1)
+        {
+           $trap_attempted_to_log++;
+ 
+           # Backslash any quotes
+           my $message_short2 = $message_short;
+           $message_short2 =~ s(\')(\\\')g;   #'
+           $message_short2 =~ s(\")(\\\")g;   #"
+ 
+           my $community = $var[5];
+           $community =~ s(\')(\\\')g;   #'
+           $community =~ s(\")(\\\")g;   #"
+ 
+           my @t_sql_custom_columns = ();
+           
+           if (@sql_custom_columns) {
+             @t_sql_custom_columns = @sql_custom_columns;
+             
+             for (my $i = 1; $i <= $#t_sql_custom_columns; $i+=2) {
+               $_ = $t_sql_custom_columns[$i];
+               print "Performing substitution on custom column: $_\n";
+               &substitute();
+               print "Done performing substitution on custom column: $_\n";
+               $t_sql_custom_columns[$i] = $_;
+             }
+           }
+ 
+           if (&oracle_insert($oracle_dbi_table,
+             "host_name",    $agent_dns_name,        # $A
+             "host_address", getBinaryIpV6($var[4]), # $aA
+             "type",         1, # SNMP Trap
+             "facility",     undef, # EventDB shall allow NULL, as there is no SNMP facility
+             "priority", getNumericPriority($event2[2]), # $s
+             "program", "snmptrap",
+             "message", $message_short2,
+             "created", $trap_date_time_sql,
+             @t_sql_custom_columns) == 1 ) { # 
+             $trap_successfully_logged++;
+           }
+      	}
 
         if ($postgresql_dbi_enable == 1)
         {
@@ -1896,22 +2076,18 @@ sub processtrap
             }
           }
 
-          if (&postgresql_insert($postgresql_dbi_table,
-            "eventname", $event2[0],                # $N
-            "eventid", $receivedtrap_entry,         # $i
-            "trapoid", $receivedtrap_trans,         # $O
-            "enterprise", $db_enterprise,           # $E or $e depending on $db_translate_enterprise
-            "community", $community,                # $C
-            "hostname", $agent_dns_name,            # $A
-            "agentip", $var[4],                     # $aA
-            "category", $event2[1],                 # $c
-            "severity", $event2[2],                 # $s
-            "uptime", $var[2],                      # $T
-            "traptime", $trap_date_time_sql,
-            "formatline", $message_short2,
-            @t_sql_custom_columns) == 1 ) { # 
-            $trap_successfully_logged++;
-          }
+		  		if (&postgresql_insert($postgresql_dbi_table,
+					 "host_name",    $agent_dns_name,        # $A
+					 "host_address", getBinaryIpV6($var[4]), # $aA
+					 "type",         1, # SNMP Trap
+					 "facility",     undef, # EventDB shall allow NULL, as there is no SNMP facility
+					 "priority", getNumericPriority($event2[2]), # $s
+					 "program", "snmptrap",
+					 "message", $message_short2,
+					 "created", $trap_date_time_sql,
+					 @t_sql_custom_columns) == 1 ) { #
+					 $trap_successfully_logged++;
+		  				}
         }
 
         if ($dbd_odbc_enable == 1)                       
@@ -3235,7 +3411,9 @@ sub readtrap
           chomp $line2;
           push(@rawtrap, $line2);
           $temp2.=" ".$line2;
-          if ($line2 =~ /[^\\]\"$/)     # Ends in a non-escaped quote
+          #if ($line2 =~ /[^\\]\"$/)     # Ends in a non-escaped quote
+          if ($line2 =~ /(^|[^\\])\"$/)  # Ends in a non-escaped quote
+                                         # NETWAYS Fix: Allow a newline before end of quote
           {
             last;
           }
@@ -3295,7 +3473,9 @@ sub readtrap
           chomp $line2;
           push(@rawtrap, $line2);
           $line.=" ".$line2;
-          if ($line2 =~ /[^\\]\"$/)                  # Ends in a non-escaped quote
+          #if ($line2 =~ /[^\\]\"$/)                  # Ends in a non-escaped quote
+          if ($line2 =~ /(^|[^\\])\"$/) # Ends in a non-escaped quote
+                                        # NETWAYS Fix: Allow a newline before end of quote
           {
             last;
           }
@@ -3476,6 +3656,47 @@ sub readtrap
   {
     $var[0] = strip_domain_name($var[0], $strip_domain);
     $agent_dns_name = strip_domain_name($agent_dns_name, $strip_domain);
+  }
+
+  # detect if a enterprise value is in octet format
+  # and convert it to string
+  if($fix_octets)
+  {
+    for (my $i=0;$i <= $#entvar;$i++)
+    {
+      my $value = $entvar[$i];
+      my $result = "";
+
+      # check if octet encoded
+      next if ! $value;
+      my $nonprintables = 0;
+      my $octetval = $value;
+      $octetval =~ s/\r?\n/ /gs;
+      if ($octetval =~ m/^(?:([0-9A-F]{2})\s+)*([0-9A-F]{2})\s*$/g)
+      {
+        foreach(split(/\s+/, $octetval))
+        {
+          my $char = chr hex $_;
+          if($char =~ m/[[:print:]]/)
+          {
+            $result .= $char;
+          }
+          else
+          {
+            $nonprintables++;
+            last if $nonprintables > 10; # get out early
+            $result .= "_";
+          }
+        }
+        if($nonprintables > 10) {
+          next;
+        }
+        else
+        {
+          $entvar[$i] = $result;
+        }
+      }
+    }
   }
 
   if ($DEBUGGING >= 1)
@@ -3756,6 +3977,7 @@ sub searchfortrap
       my $message_short;
       if ( ($mysql_dbi_enable == 1) ||
         ($postgresql_dbi_enable == 1) ||
+		  ($oracle_dbi_enable == 1) ||
         ($dbd_odbc_enable == 1) ||
         ($sql_win32_odbc_enable == 1) ) {
 
@@ -3811,15 +4033,53 @@ sub searchfortrap
         }
 
         &mysql_insert($mysql_dbi_table_unknown,
-          "trapoid", $receivedtrap_trans,
-          "enterprise", $db_enterprise,
-          "community", $community,
-          "hostname", $agent_dns_name, 
-          "agentip", $var[4],
-          "uptime", $var[2],
-          "traptime", $trap_date_time_sql,
-          "formatline", $message_short2,
+          "host_name",    $agent_dns_name,
+          "host_address", getBinaryIpV6($var[4]),
+          "type",         1,
+          "facility",     undef,
+          "priority", getNumericPriority($event2[2]),
+          "program", "snmptrap",
+          "message", $message_short2,
+          "created", $trap_date_time_sql,
           @t_sql_custom_columns_unknown);
+      }
+
+      if ($oracle_dbi_enable == 1 && defined ($dbh_oracle) && $oracle_dbi_table_unknown ne "")
+      {
+         # Backslash any quotes
+         my $message_short2 = $message_short;
+         $message_short2 =~ s(\')(\\\')g;   #'
+         $message_short2 =~ s(\")(\\\")g;   #"
+ 
+         my $community = $var[5];
+         $community =~ s(\')(\\\')g;   #'
+         $community =~ s(\")(\\\")g;   #"
+ 
+         my @t_sql_custom_columns_unknown = ();
+           
+         if (@sql_custom_columns_unknown) {
+           @t_sql_custom_columns_unknown = @sql_custom_columns_unknown;
+             
+           for (my $i = 1; $i <= $#t_sql_custom_columns_unknown; $i+=2) {
+             $_ = $t_sql_custom_columns_unknown[$i];
+             print "Performing substitution on custom column: $_\n";
+             &substitute();
+             print "Done performing substitution on custom column: $_\n";
+             $t_sql_custom_columns_unknown[$i] = $_;
+           }
+         }
+ 
+         &oracle_insert($oracle_dbi_table_unknown,
+           "host_name",    $agent_dns_name,
+           "host_address", getBinaryIpV6($var[4]),
+           "type",         1,
+           "facility",     undef,
+           "priority", getNumericPriority($event2[2]),
+           "program", "snmptrap",
+           "message", $message_short2,
+           "created", $trap_date_time_sql,
+           @t_sql_custom_columns_unknown);
+ 
       }
 
       if ($postgresql_dbi_enable == 1 && defined ($dbh_postgresql) && $postgresql_dbi_table_unknown ne "")
@@ -3848,14 +4108,14 @@ sub searchfortrap
         }
 
         &postgresql_insert($postgresql_dbi_table_unknown,
-          "trapoid", $receivedtrap_trans,
-          "enterprise", $db_enterprise,
-          "community", $community,
-          "hostname", $agent_dns_name, 
-          "agentip", $var[4],
-          "uptime", $var[2],
-          "traptime", $trap_date_time_sql,
-          "formatline", $message_short2,
+          "host_name",    $agent_dns_name,
+          "host_address", getBinaryIpV6($var[4]),
+          "type",         1,
+          "facility",     undef,
+          "priority", getNumericPriority($event2[2]),
+          "program", "snmptrap",
+          "message", $message_short2,
+          "created", $trap_date_time_sql,
           @t_sql_custom_columns_unknown);
 
       }
@@ -4086,6 +4346,7 @@ sub loadsnmpttini {
   $date_format = $cfg->val('General', 'date_format');
   $time_format = $cfg->val('General', 'time_format');
   $date_time_format = $cfg->val('General', 'date_time_format');
+  $fix_octets = $cfg->val('General','fix_octets');
 
   # DaemonMode
   $daemon_fork = $cfg->val('DaemonMode', 'daemon_fork');
@@ -4132,6 +4393,9 @@ sub loadsnmpttini {
   $unknown_trap_exec = $cfg->val('Exec', 'unknown_trap_exec');
   $unknown_trap_exec_format = $cfg->val('Exec', 'unknown_trap_exec_format');
   $exec_escape = $cfg->val('Exec', 'exec_escape');
+
+  $edbc_enable = $cfg->val('EDBC','edbc_enable'); 
+  $edbc_pipe = $cfg->val('EDBC','pipe') ;
 
   # SQL
   $db_translate_enterprise = $cfg->val('SQL', 'db_translate_enterprise');
@@ -4180,11 +4444,37 @@ sub loadsnmpttini {
   $sql_win32_odbc_username = $cfg->val('SQL', 'sql_win32_odbc_username');
   $sql_win32_odbc_password = $cfg->val('SQL', 'sql_win32_odbc_password');
 
+  $oracle_dbi_enable = $cfg->val('SQL', 'oracle_dbi_enable');
+  $oracle_dbi_module = $cfg->val('SQL', 'oracle_dbi_module');
+  $oracle_dbi_hostport_enable = $cfg->val('SQL', 'oracle_dbi_hostport_enable');
+  $oracle_dbi_timeformat = $cfg->val('SQL', 'oracle_dbi_timeformat');
+  $oracle_dbi_host = $cfg->val('SQL', 'oracle_dbi_host');
+  $oracle_dbi_port = $cfg->val('SQL', 'oracle_dbi_port');
+  $oracle_dbi_sid = $cfg->val('SQL', 'oracle_dbi_sid');
+  $oracle_dbi_table = $cfg->val('SQL', 'oracle_dbi_table');
+  $oracle_dbi_table_unknown = $cfg->val('SQL', 'oracle_dbi_table_unknown');
+  $oracle_dbi_table_statistics = $cfg->val('SQL', 'oracle_dbi_table_statistics');
+  $oracle_dbi_username = $cfg->val('SQL', 'oracle_dbi_username');
+  $oracle_dbi_password = $cfg->val('SQL', 'oracle_dbi_password');
+  $oracle_ping_on_insert = $cfg->val('SQL', 'oracle_ping_on_insert');
+  $oracle_ping_interval = $cfg->val('SQL', 'oracle_ping_interval');
+
   @sql_custom_columns = $cfg->val('SQL', 'sql_custom_columns');
   @sql_custom_columns_unknown = $cfg->val('SQL', 'sql_custom_columns_unknown');
 
   $date_time_format_sql = $cfg->val('SQL', 'date_time_format_sql');
   $stat_time_format_sql = $cfg->val('SQL', 'stat_time_format_sql');
+
+
+  # Time interval Exceptions
+  
+  $timeexceptions_conf = $cfg->val('TimeException', 'timeexceptions_conf');
+
+  # Host rewrite
+  $hostrewrite_enable = $cfg->val('HostRewrite', 'enable');
+  @hostrewrite_hosts = $cfg->val('HostRewrite', 'rewritehosts');
+  $hostrewrite_stripdomain = $cfg->val('HostRewrite', 'stripdomain');
+  
   
   # Debugging
   if ($debugcmdline == 0) {
@@ -4241,6 +4531,7 @@ sub loadsnmpttini {
   if (! defined ($use_trap_time)) { $use_trap_time = 1} ;
   if (! defined ($keep_unlogged_traps)) { $keep_unlogged_traps = 1} ;
   if (! defined ($duplicate_trap_window)) { $duplicate_trap_window = 0} ;
+  if (! defined ($fix_octets)) { $fix_octets = 0} ;
 
   if (! defined ($stdout_enable)) { $stdout_enable = 0} ;
   if (! defined ($log_enable)) { $log_enable = 1} ;
@@ -4263,6 +4554,11 @@ sub loadsnmpttini {
   if (! defined ($pre_exec_enable)) { $pre_exec_enable = 1} ;
   if (! defined ($unknown_trap_exec)) { $unknown_trap_exec = ''} ;
   if (! defined ($unknown_trap_exec_format)) { $unknown_trap_exec_format = ''} ;
+  if (! defined ($timeexceptions_conf)) { $timeexceptions_conf = ''} ;
+  if (! defined ($hostrewrite_enable)) { $hostrewrite_enable = 0} ;
+  if (! defined (@hostrewrite_hosts)) { @hostrewrite_hosts = ()} ;
+  if (! defined ($hostrewrite_stripdomain)) { $hostrewrite_stripdomain = 0} ;
+
   if (! defined ($exec_escape)) {
     if ($^O =~ /MSWin32/) {
       $exec_escape = 0;
@@ -4273,6 +4569,8 @@ sub loadsnmpttini {
   }
   if (! defined ($db_translate_enterprise)) { $db_translate_enterprise = 0} ;
   if (! defined ($db_unknown_trap_format)) { $db_unknown_trap_format = '$-*'} ;
+  if (! defined ($edbc_enable)) { $edbc_enable = 0} ;
+  if (! defined ($edbc_pipe)) { $edbc_pipe = '/tmp/edbc.pipe'} ;
   if (! defined ($mysql_dbi_enable)) { $mysql_dbi_enable = 0} ;
   if (! defined ($mysql_dbi_host)) { $mysql_dbi_host = 'localhost'} ;
   if (! defined ($mysql_dbi_port)) { $mysql_dbi_port = '3306'} ;
@@ -4297,6 +4595,19 @@ sub loadsnmpttini {
   if (! defined ($postgresql_dbi_password)) { $postgresql_dbi_password = ''} ;
   if (! defined ($postgresql_ping_on_insert)) { $postgresql_ping_on_insert = 1} ;
   if (! defined ($postgresql_ping_interval)) { $postgresql_ping_interval = 500} ;
+  if (! defined ($oracle_dbi_enable)) { $oracle_dbi_enable = 0} ;
+  if (! defined ($oracle_dbi_module)) { $oracle_dbi_module = 0} ;
+  if (! defined ($oracle_dbi_hostport_enable)) { $oracle_dbi_hostport_enable = 0} ;
+  if (! defined ($oracle_dbi_host)) { $oracle_dbi_host = 'localhost'} ;
+  if (! defined ($oracle_dbi_port)) { $oracle_dbi_port = '1521'} ;
+  if (! defined ($oracle_dbi_sid)) { $oracle_dbi_sid = ''} ;
+  if (! defined ($oracle_dbi_table)) { $oracle_dbi_table = ''} ;
+  if (! defined ($oracle_dbi_table_unknown)) { $oracle_dbi_table_unknown = ''} ;
+  if (! defined ($oracle_dbi_table_statistics)) { $oracle_dbi_table_statistics = ''} ;
+  if (! defined ($oracle_dbi_username)) { $oracle_dbi_username = ''} ;
+  if (! defined ($oracle_dbi_password)) { $oracle_dbi_password = ''} ;
+  if (! defined ($oracle_ping_on_insert)) { $oracle_ping_on_insert = 1} ;
+  if (! defined ($oracle_ping_interval)) { $oracle_ping_interval = 500} ;
   if (! defined ($dbd_odbc_enable)) { $dbd_odbc_enable = 0} ;
   if (! defined ($dbd_odbc_dsn)) { $dbd_odbc_dsn = ''} ;
   if (! defined ($dbd_odbc_table)) { $dbd_odbc_table = ''} ;
@@ -5326,6 +5637,28 @@ sub log_statistics {
       "total_ignored", $g_total_traps_ignored,
       "total_unknown", $g_total_traps_unknown);
   }
+  
+  if ($oracle_dbi_enable == 1 && defined ($dbh_oracle) && $oracle_dbi_table_statistics ne "")
+  {
+    my $stat_time_temp;
+ 
+    if ($stat_time_format_sql eq "") {
+       $stat_time_temp = localtime();
+     }
+     else {
+       $stat_time_temp = strftime $stat_time_format_sql, localtime();
+     }
+ 
+     &oracle_insert($oracle_dbi_table_statistics,
+       "stat_time", $stat_time_temp,
+       "total_received", $g_total_traps_received,
+       "total_translated", $g_total_traps_translated,
+       "total_ignored", $g_total_traps_ignored,
+       "total_unknown", $g_total_traps_unknown);
+  }
+
+  $g_last_statistics_logged = time();
+}
 
   if ($dbd_odbc_enable == 1 && defined ($dbh_odbc) && $dbd_odbc_table_statistics ne "")
   {
@@ -5365,8 +5698,6 @@ sub log_statistics {
       "total_unknown", $g_total_traps_unknown);
   }
 
-  $g_last_statistics_logged = time();
-}
 
 sub signal_log_statistics {
   #
@@ -5379,6 +5710,7 @@ sub signal_log_statistics {
 sub create_db_connections {
   &dbh_mysql_connect();
   &dbh_postgresql_connect();
+  &dbh_oracle_connect();
   &dbh_odbc_connect();
   &dbh_win32_odbc_connect();
 }
@@ -5386,6 +5718,7 @@ sub create_db_connections {
 sub close_db_connections {
   &dbh_mysql_close();
   &dbh_postgresql_close();
+  &dbh_oracle_close();
   &dbh_odbc_close();
   &dbh_win32_odbc_close();
 }
@@ -5404,6 +5737,14 @@ sub dbh_postgresql_close {
     $dbh_postgresql->disconnect;
     $dbh_postgresql = undef;
   }
+}
+
+sub dbh_oracle_close {
+	if (defined $dbh_oracle)
+	{
+		$dbh_oracle->disconnect;
+		$dbh_oracle = undef;
+	}
 }
 
 sub dbh_odbc_close {
@@ -5504,6 +5845,38 @@ sub dbh_postgresql_connect() {
   }
 }
 
+sub dbh_oracle_connect() {
+  if ($oracle_dbi_enable == 1)
+  {
+    &dbh_oracle_close();
+
+    unless ($dbh_oracle = DBI->connect("DBI:Oracle:SID=$oracle_dbi_sid;host=$oracle_dbi_host;
+        port=$oracle_dbi_port",$oracle_dbi_username,$oracle_dbi_password) )
+    {
+      my $msg = "DBI:Oracle error: Unable to connect to database: $DBI::errstr";
+      warn $msg, "\n";
+      if ($DEBUGGING >= 1)
+      {
+        print $msg, "\n";
+      }
+      if ($syslog_system_enable == 1)
+      {
+        syslog_system($msg);
+      }
+      if ($log_system_enable == 1)
+      {
+        log_system($msg);
+      }
+      if ($eventlog_system_enable == 1)
+      {
+        eventlog_system($msg,12,$eventlog_error);
+      }
+    }
+
+    $dbh_oracle->prepare('ALTER SESSION SET NLS_DATE_FORMAT = "YYYY-MM-DD HH24:MI:SS"')->execute();
+	} 
+}
+
 sub dbh_odbc_connect() { 
   if ($dbd_odbc_enable == 1)
   {
@@ -5596,6 +5969,27 @@ sub postgresql_ping {
   }
 }
 
+sub oracle_ping {
+  if ($oracle_dbi_enable == 1) {
+    if (defined ($dbh_oracle)) {
+      my $rc = $dbh_oracle->ping;
+      if (!$rc) { 
+        &dbh_oracle_connect();
+      }
+    }
+    else {
+      &dbh_oracle_connect();
+    }
+  }
+
+  $g_last_oracle_ping = time();
+
+  if ($DEBUGGING >= 2)
+  {
+    print "Oracle Ping\n"
+  }
+}
+
 sub dbd_odbc_ping {
   if ($dbd_odbc_enable == 1) {
     if (defined ($dbh_odbc)) {
@@ -5634,7 +6028,6 @@ sub mysql_insert {
   my @sql_execute;
   
   for (my $i = 0; $i < $#data;) {
-    #print $data[$i]. "\n";
     $sql_prepare .= $data[$i];
     push (@sql_execute, $data[$i+1]);
     
@@ -5851,6 +6244,121 @@ sub postgresql_insert {
   return 0;
 }
 
+sub oracle_insert {
+  my $table = shift;
+  my @data = @_;
+
+  # If the number of elements in @data is odd, remove the last element
+  # Note:  $# returns the last element # so it's reall #$data + 1
+  #print "mod :" . $#data % 2 . "\n";
+  if ($#data % 2 == 0) {
+    pop @data;
+  }
+  
+  #print "------------------ oracle_insert ---------------\n";
+    
+  my $sql_prepare = "INSERT INTO $table (";
+  my @sql_execute;
+  
+  # Create padded binary string that can be feeded to Oracle's RAW fields
+  my @array = unpack("C*", @data[3]);
+  my $raw_address = "";
+  foreach my $byte (@array) { 
+     if($byte < 0x10) {
+         $raw_address = $raw_address.sprintf("0%x",$byte);
+     } else {
+	$raw_address = $raw_address.sprintf("%x",$byte);
+     }
+  } 
+  @data[3] = $raw_address;
+  
+  for (my $i = 0; $i < $#data;) {
+    #print $data[$i]. "\n";
+    $sql_prepare .= $data[$i];
+    push (@sql_execute, $data[$i+1]);
+    
+    $i+=2;
+        
+    if ($i < ($#data)) {
+      $sql_prepare .= ",";
+    }
+  }
+  $sql_prepare .= ") VALUES (?,?,?, ?, ?, ?, ?, ?) ";
+  # Make sure the connection is up
+  if ($oracle_ping_on_insert == 1) {
+    &oracle_ping();
+  }
+  
+  if (defined ($dbh_oracle)) {
+    my $prepare_successful = 0;
+    my $do_successful = 0;
+
+    my $sth_oracle = $dbh_oracle->prepare($sql_prepare);
+    unless (defined ($sth_oracle)) {
+      my $msg = "Oracle error " . $dbh_oracle->{'errno'} . ": Unable to perform PREPARE: ".$dbh_oracle->errstr;                             
+      warn $msg, "\n";
+
+      if ($DEBUGGING >= 1)
+      {
+        print $msg, "\n";
+      }
+
+      if ($syslog_system_enable == 1)
+      {
+        syslog_system($msg);
+      }
+      if ($log_system_enable == 1)
+      {
+        log_system($msg);
+      }
+      if ($eventlog_system_enable == 1)
+      {
+        eventlog_system($msg,23,$eventlog_error);
+      }
+    }
+	  else {
+      $prepare_successful = 1;
+    }
+ 
+    if ($prepare_successful == 1)
+    {
+      unless (defined ($sth_oracle->execute(@sql_execute))) {
+        my $msg = "Oracle error " . $dbh_oracle->{'errno'} . ": Unable to perform INSERT INTO (EXECUTE): ".$dbh_oracle->errstr;
+        warn $msg, "\n";
+
+        if ($DEBUGGING >= 1)
+        {
+          print $msg, "\n";
+        }
+ 
+        if ($syslog_system_enable == 1)
+        {
+          syslog_system($msg);
+        }
+ 
+        if ($log_system_enable == 1)
+        {
+          log_system($msg);
+        }
+ 
+        if ($eventlog_system_enable == 1)
+        {
+          eventlog_system($msg,15,$eventlog_error);
+        }
+      }
+      else {
+        $do_successful = 1;
+      }
+    }
+ 
+    if ($do_successful == 1)  
+    {
+      return 1;
+    }
+  }
+  return 0;
+}
+ 
 sub odbc_insert {
   my $table = shift;
   my @data = @_;
@@ -6031,9 +6539,32 @@ sub reopen_debug_file {
   return 0;
 }
 
+sub getBinaryIpV6 {
+    use NetAddr::IP::Util qw(ipv6_aton);
+    my $ip = shift;
+    $ip = '::ffff:' . $ip if $ip =~ /^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/;
+    return ipv6_aton($ip);
+}
 
+sub getNumericPriority {
+    my $pri = lc(substr(shift, 0, 4));
+    my %priomap = (
+        'emer' => 0,
+        'aler' => 1,
+        'crit' => 2,
+        'majo' => 2,
+        'erro' => 3,
+        'warn' => 4,
+        'noti' => 5,
+        'mino' => 5,
+        'ok'   => 5,
+        'info' => 6,
+        'norm' => 6,
+        'debu' => 7
+    );
+    return $priomap{$pri} if (defined $priomap{$pri});
+    return 5;
+}
 
-
-
-
+# vi: ts=2 sw=2 expandtab :
 
